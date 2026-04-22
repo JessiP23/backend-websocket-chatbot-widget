@@ -1,7 +1,8 @@
 import os
 import json
 import uuid
-from typing import Optional
+import httpx
+from typing import Optional, List
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,22 +38,16 @@ SYSTEM_PROMPT = os.environ.get(
     "Be concise, clear, and professional.",
 )
 
-# In-memory session history (resets on restart)
-sessions: dict[str, list[dict]] = {}
+# Supabase config (optional — insight storage only)
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
+# Browser owns conversation history — no server-side session storage needed.
 
-def get_history(session_id: str) -> list[dict]:
-    if session_id not in sessions:
-        sessions[session_id] = []
-    return sessions[session_id]
-
-
-async def stream_ai_response(session_id: str, user_message: str):
-    """Async generator that yields text chunks from Groq."""
-    history = get_history(session_id)
-    history.append({"role": "user", "content": user_message})
-
+async def stream_ai_response(history: list[dict], user_message: str):
+    """Async generator that yields text chunks from Groq. History comes from the browser."""
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history[-20:]
+    messages.append({"role": "user", "content": user_message})
 
     full_response = ""
     stream = await client.chat.completions.create(
@@ -69,15 +64,11 @@ async def stream_ai_response(session_id: str, user_message: str):
             full_response += delta
             yield delta
 
-    history.append({"role": "assistant", "content": full_response})
 
-
-async def get_ai_response(session_id: str, user_message: str) -> str:
+async def get_ai_response(history: list[dict], user_message: str) -> str:
     """Non-streaming response for REST fallback."""
-    history = get_history(session_id)
-    history.append({"role": "user", "content": user_message})
-
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history[-20:]
+    messages.append({"role": "user", "content": user_message})
 
     response = await client.chat.completions.create(
         model=GROQ_MODEL,
@@ -86,9 +77,7 @@ async def get_ai_response(session_id: str, user_message: str) -> str:
         max_tokens=1024,
     )
 
-    bot_reply = response.choices[0].message.content or ""
-    history.append({"role": "assistant", "content": bot_reply})
-    return bot_reply
+    return response.choices[0].message.content or ""
 
 
 # ── WebSocket endpoint ────────────────────────────────────────────────────────
@@ -116,13 +105,13 @@ async def websocket_chat(
 
             if msg_type == "chat_message":
                 user_text = data.get("text", "").strip()
-                sid = data.get("session_id", session_id) or session_id
+                history   = data.get("history", [])  # full history sent by browser
                 if not user_text:
                     continue
 
                 message_id = str(uuid.uuid4())
                 try:
-                    async for chunk_text in stream_ai_response(sid, user_text):
+                    async for chunk_text in stream_ai_response(history, user_text):
                         await websocket.send_text(json.dumps({
                             "type": "chunk",
                             "message_id": message_id,
@@ -156,6 +145,7 @@ class ConversationRequest(BaseModel):
     session_id: Optional[str] = ""
     tenant_id: Optional[str] = None
     user_message: str
+    history: List[dict] = []
 
 
 @app.post("/api/v1/conversations")
@@ -164,11 +154,82 @@ async def conversation(req: ConversationRequest):
         raise HTTPException(status_code=400, detail="user_message is required")
 
     try:
-        bot_reply = await get_ai_response(req.session_id or "rest", req.user_message)
+        bot_reply = await get_ai_response(req.history, req.user_message)
         return {"bot_response": bot_reply, "session_id": req.session_id}
     except Exception as e:
         print(f"[REST] Groq error: {e}")
         raise HTTPException(status_code=500, detail="AI service error")
+
+
+# ── Session insight endpoint ───────────────────────────────────────────────────
+class InsightRequest(BaseModel):
+    session_id: str
+    tenant_id: Optional[str] = None
+    messages: List[dict]  # [{ role: "user"|"assistant", content: "..." }]
+
+
+@app.post("/api/v1/sessions/insight")
+async def session_insight(req: InsightRequest):
+    print(f"[Insight] Received for session={req.session_id} messages={len(req.messages)}")
+
+    if len(req.messages) < 2:
+        print(f"[Insight] Skipped — too short ({len(req.messages)} messages)")
+        return {"status": "skipped", "reason": "too_short"}
+
+    # Ask Groq for a 2-sentence summary
+    summary_prompt = (
+        "Summarise this support conversation in exactly 2 sentences. "
+        "Include: main topic, user intent, and whether it was resolved. "
+        "Be factual and concise. No filler phrases."
+    )
+    try:
+        resp = await client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": summary_prompt},
+                *req.messages[-20:],
+                {"role": "user", "content": "Summarise the above conversation now."},
+            ],
+            temperature=0.3,
+            max_tokens=120,
+        )
+        insight = resp.choices[0].message.content or ""
+        print(f"[Insight] Generated: {insight[:80]}...")
+    except Exception as e:
+        print(f"[Insight] Groq error: {e}")
+        raise HTTPException(status_code=500, detail="AI summary failed")
+
+    # Store in Supabase — log response status and body on failure
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            async with httpx.AsyncClient() as http:
+                sb_resp = await http.post(
+                    f"{SUPABASE_URL}/rest/v1/session_insights",
+                    headers={
+                        "apikey": SUPABASE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_KEY}",
+                        "Content-Type": "application/json",
+                        "Prefer": "return=minimal",
+                    },
+                    json={
+                        "session_id": req.session_id,
+                        "tenant_id": req.tenant_id,
+                        "insight": insight,
+                        "message_count": len(req.messages),
+                    },
+                    timeout=5,
+                )
+            if sb_resp.status_code in (200, 201):
+                print(f"[Insight] Saved to Supabase ✓ (session={req.session_id})")
+            else:
+                # Log full response so we can see exactly why it failed
+                print(f"[Insight] Supabase error {sb_resp.status_code}: {sb_resp.text}")
+        except Exception as e:
+            print(f"[Insight] Supabase request failed: {e}")
+    else:
+        print("[Insight] Supabase not configured — skipping storage (set SUPABASE_URL + SUPABASE_KEY secrets)")
+
+    return {"status": "ok", "insight": insight}
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
