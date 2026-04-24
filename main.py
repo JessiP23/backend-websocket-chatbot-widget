@@ -3,12 +3,15 @@ import json
 import uuid
 import httpx
 import time
+import re
 from typing import Optional, List
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from groq import AsyncGroq
 
 app = FastAPI(title="WM Studio Chatbot API")
 
@@ -20,28 +23,136 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL   = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+# ── Config ────────────────────────────────────────────────────────────────────
+# Strip trailing /rest/v1/ from SUPABASE_URL if user included it
+_raw_supa_url = os.environ.get("SUPABASE_URL", "")
+SUPABASE_URL = re.sub(r"/rest/v1/?$", "", _raw_supa_url.rstrip("/"))
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
-groq_client  = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
-SYSTEM_PROMPT = os.environ.get(
-    "SYSTEM_PROMPT",
-    "You are a helpful support agent for WM Studio, a premium AI image and video generation platform. "
-    "Be concise, friendly, and professional.",
+OFFLINE_MESSAGE = os.environ.get(
+    "OFFLINE_MESSAGE",
+    "Thanks for your message — a team member will respond shortly.",
 )
 
-# session_id -> { ws, history:[{role,text,ts}], created_at, tenant_id }
+# ── In-memory state ──────────────────────────────────────────────────────────
+# session_id -> { ws, history:[{role,text,ts}], created_at, tenant_id, status }
 customer_sessions: dict[str, dict] = {}
 agent_connections: set[WebSocket]  = set()
 
 
-def ts() -> int:
+def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+# ── Supabase persistence ─────────────────────────────────────────────────────
+def _supa_headers() -> dict:
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+
+def _supa_ok() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+async def db_upsert_session(sid: str, created_at: int, tenant_id: Optional[str] = None, status: str = "active"):
+    if not _supa_ok():
+        return
+    try:
+        async with httpx.AsyncClient() as http:
+            await http.post(
+                f"{SUPABASE_URL}/rest/v1/chat_sessions",
+                headers={**_supa_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+                json={"session_id": sid, "created_at": created_at, "tenant_id": tenant_id, "status": status},
+                timeout=5,
+            )
+        print(f"[DB] Session upserted: {sid} status={status}")
+    except Exception as e:
+        print(f"[DB] upsert session failed: {e}")
+
+
+async def db_update_session_status(sid: str, status: str):
+    if not _supa_ok():
+        return
+    try:
+        async with httpx.AsyncClient() as http:
+            await http.patch(
+                f"{SUPABASE_URL}/rest/v1/chat_sessions?session_id=eq.{sid}",
+                headers=_supa_headers(),
+                json={"status": status},
+                timeout=5,
+            )
+        print(f"[DB] Session status updated: {sid} -> {status}")
+    except Exception as e:
+        print(f"[DB] update session status failed: {e}")
+
+
+async def db_insert_message(sid: str, role: str, text: str, ts: int):
+    if not _supa_ok():
+        return
+    try:
+        async with httpx.AsyncClient() as http:
+            await http.post(
+                f"{SUPABASE_URL}/rest/v1/chat_messages",
+                headers=_supa_headers(),
+                json={"session_id": sid, "role": role, "text": text, "ts": ts},
+                timeout=5,
+            )
+    except Exception as e:
+        print(f"[DB] insert message failed: {e}")
+
+
+async def db_load_all_sessions() -> list[dict]:
+    if not _supa_ok():
+        return []
+    try:
+        async with httpx.AsyncClient() as http:
+            r = await http.get(
+                f"{SUPABASE_URL}/rest/v1/chat_sessions?order=created_at.desc&limit=200",
+                headers={**_supa_headers(), "Prefer": ""},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                rows = r.json()
+                print(f"[DB] Loaded {len(rows)} sessions from DB")
+                return rows
+            else:
+                print(f"[DB] Load sessions HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[DB] load sessions failed: {e}")
+    return []
+
+
+async def db_load_all_histories() -> dict[str, list[dict]]:
+    if not _supa_ok():
+        return {}
+    try:
+        async with httpx.AsyncClient() as http:
+            r = await http.get(
+                f"{SUPABASE_URL}/rest/v1/chat_messages?order=ts.asc&limit=5000",
+                headers={**_supa_headers(), "Prefer": ""},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                histories: dict[str, list[dict]] = {}
+                for msg in r.json():
+                    sid = msg["session_id"]
+                    if sid not in histories:
+                        histories[sid] = []
+                    histories[sid].append({"role": msg["role"], "text": msg["text"], "ts": msg["ts"]})
+                print(f"[DB] Loaded histories for {len(histories)} sessions")
+                return histories
+            else:
+                print(f"[DB] Load histories HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[DB] load histories failed: {e}")
+    return {}
+
+
+# ── Session summary builders ─────────────────────────────────────────────────
 def session_summary(sid: str) -> dict:
     s = customer_sessions.get(sid, {})
     history = s.get("history", [])
@@ -54,6 +165,23 @@ def session_summary(sid: str) -> dict:
         "last_role":     last["role"] if last else "",
         "last_ts":       last["ts"] if last else 0,
         "online":        s.get("ws") is not None,
+        "status":        s.get("status", "active"),
+    }
+
+
+def session_summary_from_db(row: dict, messages: list[dict]) -> dict:
+    last = messages[-1] if messages else None
+    sid = row["session_id"]
+    is_online = (sid in customer_sessions and customer_sessions[sid].get("ws") is not None)
+    return {
+        "session_id":    sid,
+        "created_at":    row.get("created_at", 0),
+        "message_count": len(messages),
+        "last_text":     last["text"][:80] if last else "",
+        "last_role":     last["role"] if last else "",
+        "last_ts":       last["ts"] if last else 0,
+        "online":        is_online,
+        "status":        row.get("status", "closed"),
     }
 
 
@@ -77,10 +205,13 @@ async def customer_ws(
 ):
     await websocket.accept()
     sid = session_id or str(uuid.uuid4())
+    created = now_ms()
 
     if sid not in customer_sessions:
-        customer_sessions[sid] = {"history": [], "created_at": ts(), "tenant_id": tenant_id}
+        customer_sessions[sid] = {"history": [], "created_at": created, "tenant_id": tenant_id, "status": "active"}
+        await db_upsert_session(sid, created, tenant_id, "active")
     customer_sessions[sid]["ws"] = websocket
+    customer_sessions[sid]["status"] = "active"
 
     await websocket.send_text(json.dumps({"type": "connected", "session_id": sid}))
     await broadcast_to_agents({"type": "session_update", "session": session_summary(sid)})
@@ -104,20 +235,28 @@ async def customer_ws(
                 if not text:
                     continue
 
-                entry = {"role": "user", "text": text, "ts": ts()}
+                msg_ts = now_ms()
+                entry = {"role": "user", "text": text, "ts": msg_ts}
                 customer_sessions[sid]["history"].append(entry)
                 print(f"[Chat] session={sid} user: {text[:60]}")
+
+                await db_insert_message(sid, "user", text, msg_ts)
 
                 await broadcast_to_agents({
                     "type":       "customer_message",
                     "session_id": sid,
                     "text":       text,
-                    "ts":         entry["ts"],
+                    "ts":         msg_ts,
                     "session":    session_summary(sid),
                 })
 
+                # If no agent is online, send a simple offline message
                 if not agent_connections:
-                    await _auto_reply(sid, websocket)
+                    msg_ts2 = now_ms()
+                    entry2 = {"role": "assistant", "text": OFFLINE_MESSAGE, "ts": msg_ts2}
+                    customer_sessions[sid]["history"].append(entry2)
+                    await websocket.send_text(json.dumps({"type": "bot_response", "text": OFFLINE_MESSAGE}))
+                    await db_insert_message(sid, "assistant", OFFLINE_MESSAGE, msg_ts2)
 
     except WebSocketDisconnect:
         pass
@@ -126,31 +265,11 @@ async def customer_ws(
     finally:
         if sid in customer_sessions:
             customer_sessions[sid]["ws"] = None
+            customer_sessions[sid]["status"] = "closed"
+        # Mark session as closed in DB
+        await db_update_session_status(sid, "closed")
         await broadcast_to_agents({"type": "session_update", "session": session_summary(sid)})
         print(f"[Chat] Customer disconnected session={sid}")
-
-
-async def _auto_reply(sid: str, ws: WebSocket):
-    """Fallback when no agent is online — Groq if available, else canned message."""
-    if groq_client:
-        history = customer_sessions[sid].get("history", [])
-        msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for h in history[-20:]:
-            msgs.append({"role": "user" if h["role"] == "user" else "assistant", "content": h["text"]})
-        try:
-            resp = await groq_client.chat.completions.create(
-                model=GROQ_MODEL, messages=msgs, temperature=0.7, max_tokens=512
-            )
-            reply_text = resp.choices[0].message.content or "I'll look into that for you."
-        except Exception as e:
-            print(f"[AutoReply] Groq error: {e}")
-            reply_text = "Our team will get back to you shortly."
-    else:
-        reply_text = "Thanks for your message — a team member will respond shortly."
-
-    entry = {"role": "assistant", "text": reply_text, "ts": ts()}
-    customer_sessions[sid]["history"].append(entry)
-    await ws.send_text(json.dumps({"type": "bot_response", "text": reply_text}))
 
 
 # ── Agent WebSocket ───────────────────────────────────────────────────────────
@@ -162,11 +281,34 @@ async def agent_ws(
     agent_connections.add(websocket)
     print(f"[Agent] Agent connected. Total agents: {len(agent_connections)}")
 
-    # Send all current sessions + full histories on connect
+    # Build init: merge DB + in-memory
+    db_sessions = await db_load_all_sessions()
+    db_histories = await db_load_all_histories()
+
+    all_sids = set()
+    merged_sessions = []
+    merged_histories: dict[str, list[dict]] = {}
+
+    for row in db_sessions:
+        sid = row["session_id"]
+        all_sids.add(sid)
+        msgs = db_histories.get(sid, [])
+        if sid in customer_sessions:
+            mem = customer_sessions[sid].get("history", [])
+            if len(mem) > len(msgs):
+                msgs = mem
+        merged_sessions.append(session_summary_from_db(row, msgs))
+        merged_histories[sid] = msgs
+
+    for sid, sdata in customer_sessions.items():
+        if sid not in all_sids:
+            merged_sessions.append(session_summary(sid))
+            merged_histories[sid] = sdata.get("history", [])
+
     await websocket.send_text(json.dumps({
         "type":     "init",
-        "sessions": [session_summary(sid) for sid in customer_sessions],
-        "history":  {sid: customer_sessions[sid].get("history", []) for sid in customer_sessions},
+        "sessions": merged_sessions,
+        "history":  merged_histories,
     }))
 
     try:
@@ -185,9 +327,12 @@ async def agent_ws(
                 if not sid or not text:
                     continue
 
-                entry = {"role": "assistant", "text": text, "ts": ts()}
+                msg_ts = now_ms()
+                entry = {"role": "assistant", "text": text, "ts": msg_ts}
                 if sid in customer_sessions:
                     customer_sessions[sid]["history"].append(entry)
+
+                await db_insert_message(sid, "assistant", text, msg_ts)
 
                 cust_ws = customer_sessions.get(sid, {}).get("ws")
                 if cust_ws:
@@ -203,7 +348,7 @@ async def agent_ws(
                     "type":       "agent_reply_echo",
                     "session_id": sid,
                     "text":       text,
-                    "ts":         entry["ts"],
+                    "ts":         msg_ts,
                 })
 
             if mtype == "typing":
@@ -224,64 +369,6 @@ async def agent_ws(
         print(f"[Agent] Agent disconnected. Total agents: {len(agent_connections)}")
 
 
-# ── Session insight ───────────────────────────────────────────────────────────
-class InsightRequest(BaseModel):
-    session_id: str
-    tenant_id:  Optional[str] = None
-    messages:   List[dict]
-
-
-@app.post("/api/v1/sessions/insight")
-async def session_insight(req: InsightRequest):
-    print(f"[Insight] session={req.session_id} messages={len(req.messages)}")
-    if len(req.messages) < 2:
-        return {"status": "skipped", "reason": "too_short"}
-
-    insight = ""
-    if groq_client:
-        try:
-            resp = await groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {"role": "system", "content":
-                     "Summarise this support conversation in 2 sentences. "
-                     "Include: main topic, user intent, resolution status."},
-                    *[{"role": m.get("role","user"), "content": m.get("content", m.get("text",""))}
-                      for m in req.messages[-20:]],
-                    {"role": "user", "content": "Summarise now."},
-                ],
-                temperature=0.3, max_tokens=120,
-            )
-            insight = resp.choices[0].message.content or ""
-            print(f"[Insight] Generated: {insight[:80]}...")
-        except Exception as e:
-            print(f"[Insight] Groq error: {e}")
-
-    if SUPABASE_URL and SUPABASE_KEY:
-        try:
-            async with httpx.AsyncClient() as http:
-                r = await http.post(
-                    f"{SUPABASE_URL}/rest/v1/session_insights",
-                    headers={
-                        "apikey": SUPABASE_KEY,
-                        "Authorization": f"Bearer {SUPABASE_KEY}",
-                        "Content-Type": "application/json",
-                        "Prefer": "return=minimal",
-                    },
-                    json={"session_id": req.session_id, "tenant_id": req.tenant_id,
-                          "insight": insight, "message_count": len(req.messages)},
-                    timeout=5,
-                )
-            if r.status_code in (200, 201):
-                print(f"[Insight] Saved to Supabase ✓")
-            else:
-                print(f"[Insight] Supabase error {r.status_code}: {r.text}")
-        except Exception as e:
-            print(f"[Insight] Supabase failed: {e}")
-
-    return {"status": "ok", "insight": insight}
-
-
 # ── REST fallback ─────────────────────────────────────────────────────────────
 class ConversationRequest(BaseModel):
     session_id:   Optional[str] = ""
@@ -294,24 +381,19 @@ class ConversationRequest(BaseModel):
 async def conversation(req: ConversationRequest):
     if not req.user_message.strip():
         raise HTTPException(status_code=400, detail="user_message is required")
-    if not groq_client:
-        return {"bot_response": "A team member will respond shortly.", "session_id": req.session_id}
-    try:
-        msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for h in req.history[-20:]:
-            msgs.append({"role": h.get("role","user"), "content": h.get("content", h.get("text",""))})
-        msgs.append({"role": "user", "content": req.user_message})
-        resp = await groq_client.chat.completions.create(model=GROQ_MODEL, messages=msgs, temperature=0.7, max_tokens=512)
-        return {"bot_response": resp.choices[0].message.content or "", "session_id": req.session_id}
-    except Exception as e:
-        print(f"[REST] error: {e}")
-        raise HTTPException(status_code=500, detail="Service error")
+    return {"bot_response": OFFLINE_MESSAGE, "session_id": req.session_id}
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "active_sessions": len(customer_sessions), "agents_online": len(agent_connections)}
+    return {
+        "status": "ok",
+        "active_sessions": len([s for s in customer_sessions.values() if s.get("ws")]),
+        "total_sessions": len(customer_sessions),
+        "agents_online": len(agent_connections),
+        "supabase": _supa_ok(),
+    }
 
 @app.get("/")
 def root():
