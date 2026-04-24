@@ -248,13 +248,9 @@ async def customer_ws(
                     "session":    session_summary(sid),
                 })
 
-                # If no agent is online, send a simple offline message
-                if not agent_connections:
-                    msg_ts2 = now_ms()
-                    entry2 = {"role": "assistant", "text": OFFLINE_MESSAGE, "ts": msg_ts2}
-                    customer_sessions[sid]["history"].append(entry2)
-                    await websocket.send_text(json.dumps({"type": "bot_response", "text": OFFLINE_MESSAGE}))
-                    await db_insert_message(sid, "assistant", OFFLINE_MESSAGE, msg_ts2)
+                # Human-only — no auto-reply. Message is stored and
+                # forwarded to the agent dashboard; user waits for a
+                # real human response.
 
     except WebSocketDisconnect:
         pass
@@ -379,7 +375,7 @@ class ConversationRequest(BaseModel):
 async def conversation(req: ConversationRequest):
     if not req.user_message.strip():
         raise HTTPException(status_code=400, detail="user_message is required")
-    return {"bot_response": OFFLINE_MESSAGE, "session_id": req.session_id}
+    return {"bot_response": "Your message has been received.", "session_id": req.session_id}
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
